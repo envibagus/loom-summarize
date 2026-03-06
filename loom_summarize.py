@@ -192,11 +192,7 @@ def build_transcript_text(segments: list[dict], frames: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def summarize(transcript: str) -> str:
-    """Summarize transcript using Claude CLI."""
-    print("\n[5/5] Summarizing with Claude...")
-
-    prompt = f"""Summarize this Loom video transcript. Use this exact format:
+SUMMARY_PROMPT = """Summarize this Loom video transcript. Use this exact format:
 
 ## Title
 (infer a clear title from the content)
@@ -215,19 +211,106 @@ def summarize(transcript: str) -> str:
 Transcript:
 {transcript}"""
 
-    # Unset CLAUDECODE to allow nested invocation
+
+def summarize_claude(transcript: str) -> str:
+    """Summarize using Claude CLI (claude -p)."""
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
     result = subprocess.run(
-        ["claude", "-p", prompt],
-        capture_output=True,
-        text=True,
-        env=env,
+        ["claude", "-p", SUMMARY_PROMPT.format(transcript=transcript)],
+        capture_output=True, text=True, env=env,
     )
     if result.returncode != 0:
         print(f"Error running Claude:\n{result.stderr}", file=sys.stderr)
         sys.exit(1)
-
     return result.stdout.strip()
+
+
+def summarize_ollama(transcript: str, model: str) -> str:
+    """Summarize using Ollama (local LLM)."""
+    result = subprocess.run(
+        ["ollama", "run", model],
+        input=SUMMARY_PROMPT.format(transcript=transcript),
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"Error running Ollama:\n{result.stderr}", file=sys.stderr)
+        sys.exit(1)
+    return result.stdout.strip()
+
+
+def summarize_openai(transcript: str, model: str) -> str:
+    """Summarize using OpenAI API (requires OPENAI_API_KEY env var)."""
+    import json
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        print("Error: OPENAI_API_KEY environment variable not set", file=sys.stderr)
+        sys.exit(1)
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": SUMMARY_PROMPT.format(transcript=transcript)}],
+    })
+    result = subprocess.run(
+        ["curl", "-s", "https://api.openai.com/v1/chat/completions",
+         "-H", f"Authorization: Bearer {api_key}",
+         "-H", "Content-Type: application/json",
+         "-d", payload],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"Error calling OpenAI API:\n{result.stderr}", file=sys.stderr)
+        sys.exit(1)
+    resp = json.loads(result.stdout)
+    if "error" in resp:
+        print(f"OpenAI API error: {resp['error']['message']}", file=sys.stderr)
+        sys.exit(1)
+    return resp["choices"][0]["message"]["content"].strip()
+
+
+def summarize_gemini(transcript: str, model: str) -> str:
+    """Summarize using Google Gemini API (requires GEMINI_API_KEY env var)."""
+    import json
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("Error: GEMINI_API_KEY environment variable not set", file=sys.stderr)
+        sys.exit(1)
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": SUMMARY_PROMPT.format(transcript=transcript)}]}],
+    })
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    result = subprocess.run(
+        ["curl", "-s", url,
+         "-H", "Content-Type: application/json",
+         "-d", payload],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"Error calling Gemini API:\n{result.stderr}", file=sys.stderr)
+        sys.exit(1)
+    resp = json.loads(result.stdout)
+    if "error" in resp:
+        print(f"Gemini API error: {resp['error']['message']}", file=sys.stderr)
+        sys.exit(1)
+    return resp["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
+def summarize(transcript: str, llm: str) -> str:
+    """Summarize transcript using the selected LLM provider."""
+    print(f"\n[5/5] Summarizing with {llm}...")
+
+    if llm == "claude":
+        return summarize_claude(transcript)
+    elif llm.startswith("ollama:"):
+        model = llm.split(":", 1)[1]
+        return summarize_ollama(transcript, model)
+    elif llm.startswith("openai:"):
+        model = llm.split(":", 1)[1]
+        return summarize_openai(transcript, model)
+    elif llm.startswith("gemini:"):
+        model = llm.split(":", 1)[1]
+        return summarize_gemini(transcript, model)
+    else:
+        print(f"Unknown LLM provider: {llm}", file=sys.stderr)
+        sys.exit(1)
 
 
 def extract_title(summary: str) -> str | None:
@@ -302,6 +385,7 @@ def main():
     parser = argparse.ArgumentParser(description="Download, transcribe, and summarize Loom videos.")
     parser.add_argument("url", help="Loom video URL")
     parser.add_argument("--transcript-only", action="store_true", help="Only transcribe, skip summarization")
+    parser.add_argument("--llm", default="claude", help="LLM to use for summarization: claude (default), ollama:<model>, openai:<model>")
     args = parser.parse_args()
 
     # Validate URL
@@ -330,7 +414,7 @@ def main():
         # Summarize (unless --transcript-only)
         summary = None
         if not args.transcript_only:
-            summary = summarize(transcript)
+            summary = summarize(transcript, args.llm)
 
         # Save output (video, SRT, frames, markdown)
         saved_path = save_output(args.url, transcript, summary, video_path, frames, srt, recorder)
